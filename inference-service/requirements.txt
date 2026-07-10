@@ -1,0 +1,7 @@
+opencv-python==4.10.0.84
+numpy==1.26.4
+python-dotenv==1.0.1
+
+# Added in later days (Day 2+) — uncomment as you go:
+# ultralytics==8.3.0
+# redis==5.0.8
