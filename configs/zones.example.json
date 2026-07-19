@@ -1,0 +1,9 @@
+[
+  {
+    "zone_id": "zone_1",
+    "camera_id": "cam_1",
+    "name": "Restricted Area A",
+    "rule_type": "zone_intrusion",
+    "polygon": [[100, 200], [300, 200], [300, 400], [100, 400]]
+  }
+]
