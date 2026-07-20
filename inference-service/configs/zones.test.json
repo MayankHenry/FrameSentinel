@@ -1,0 +1,11 @@
+﻿[
+  {
+    "zone_id": "zone_1",
+    "camera_id": "cam_1",
+    "name": "Loitering Test",
+    "rule_type": "loitering",
+    "polygon": [[1650, 1400], [1780, 1400], [1780, 1500], [1650, 1500]],
+    "loiter_seconds": 8,
+    "movement_threshold_px": 30
+  }
+]

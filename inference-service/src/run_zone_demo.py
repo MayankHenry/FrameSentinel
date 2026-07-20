@@ -44,12 +44,14 @@ def draw_zones(image, zones, camera_id: str):
     for zone in zones:
         if zone.camera_id != camera_id:
             continue
+        color = (255, 0, 255) if zone.rule_type == "zone_intrusion" else (0, 140, 255)
         pts = [(int(x), int(y)) for x, y in zone.polygon]
         for i in range(len(pts)):
-            cv2.line(annotated, pts[i], pts[(i + 1) % len(pts)], (255, 0, 255), 2)
+            cv2.line(annotated, pts[i], pts[(i + 1) % len(pts)], color, 2)
         label_pos = pts[0]
-        cv2.putText(annotated, zone.name, label_pos,
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+        label = f"{zone.name} ({zone.rule_type})"
+        cv2.putText(annotated, label, label_pos,
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
     return annotated
 
 
@@ -75,6 +77,12 @@ def main() -> int:
     parser.add_argument("--model", default="models/yolov8n.pt")
     parser.add_argument("--conf", type=float, default=0.35)
     parser.add_argument("--classes", type=str, default="0", help="default '0' = person only")
+    parser.add_argument("--dedup-cooldown", type=float, default=30.0,
+                         help="Seconds before the same (track, zone, rule) can alert again")
+    parser.add_argument("--debug-centroids", action="store_true",
+                         help="Print every track's centroid each frame — use this to "
+                              "confirm where your tracked position actually is relative "
+                              "to your zone polygon coordinates, if zones aren't firing.")
     parser.add_argument("--display", action="store_true")
     parser.add_argument("--save-video", type=str, default=None)
     args = parser.parse_args()
@@ -85,6 +93,8 @@ def main() -> int:
         parser.error("--conf must be in (0, 1]")
     if not args.camera_id:
         parser.error("--camera-id cannot be empty")
+    if args.dedup_cooldown <= 0:
+        parser.error("--dedup-cooldown must be positive")
 
     try:
         source = resolve_source(args.source)
@@ -104,6 +114,12 @@ def main() -> int:
         log.warning("No zones configured for camera_id='%s' — the pipeline will run "
                     "but no zone-intrusion alerts will ever fire. Check --camera-id "
                     "matches the camera_id used in your zones config.", args.camera_id)
+    elif args.debug_centroids:
+        for z in relevant_zones:
+            xs = [p[0] for p in z.polygon]
+            ys = [p[1] for p in z.polygon]
+            log.info("Zone '%s' (%s) bounding box: x=[%.0f, %.0f] y=[%.0f, %.0f]",
+                      z.name, z.rule_type, min(xs), max(xs), min(ys), max(ys))
 
     try:
         tracker = Tracker(model_path=args.model, conf_threshold=args.conf, classes=classes)
@@ -111,7 +127,7 @@ def main() -> int:
         log.error("Could not initialize tracker: %s", exc)
         return 1
 
-    engine = RuleEngine(zones)
+    engine = RuleEngine(zones, dedup_cooldown_seconds=args.dedup_cooldown)
 
     writer = None
     display_active = False
@@ -133,6 +149,14 @@ def main() -> int:
                                   class_name=t.class_name, confidence=t.confidence)
                     for t in result.tracks
                 ]
+
+                if args.debug_centroids and snapshots:
+                    positions = ", ".join(
+                        f"id={s.track_id} centroid=({s.centroid[0]:.0f},{s.centroid[1]:.0f})"
+                        for s in snapshots
+                    )
+                    log.info("t=%.1fs %s", frame.timestamp, positions)
+
                 events = engine.evaluate(snapshots, camera_id=args.camera_id,
                                           timestamp=frame.timestamp)
 
