@@ -65,6 +65,7 @@ SUPPORTED_RULE_TYPES = {"zone_intrusion", "loitering"}
 # Sane defaults for loitering, used when a zone config omits the optional field.
 DEFAULT_MOVEMENT_THRESHOLD_PX = 30.0
 DEFAULT_DEDUP_COOLDOWN_SECONDS = 30.0
+DEFAULT_TRACK_ABSENCE_GRACE_SECONDS = 1.5
 
 Point = Tuple[float, float]
 
@@ -393,12 +394,17 @@ class RuleEngine:
     """
 
     def __init__(self, zones: List[Zone], deduplicator: Optional[AlertDeduplicator] = None,
-                 dedup_cooldown_seconds: float = DEFAULT_DEDUP_COOLDOWN_SECONDS):
+                 dedup_cooldown_seconds: float = DEFAULT_DEDUP_COOLDOWN_SECONDS,
+                 track_absence_grace_seconds: float = DEFAULT_TRACK_ABSENCE_GRACE_SECONDS):
         if not isinstance(zones, list):
             raise TypeError("zones must be a list of Zone objects")
         for z in zones:
             if not isinstance(z, Zone):
                 raise TypeError(f"Expected Zone instance, got {type(z)}")
+        if track_absence_grace_seconds <= 0:
+            raise ValueError(
+                f"track_absence_grace_seconds must be positive, got {track_absence_grace_seconds}"
+            )
 
         self.zones = zones
         self._zones_by_camera: Dict[str, List[Zone]] = {}
@@ -409,6 +415,9 @@ class RuleEngine:
         self._state: Dict[Tuple[int, str], bool] = {}
         # (track_id, zone_id) -> loitering dwell bookkeeping
         self._loiter_state: Dict[Tuple[int, str], _LoiterState] = {}
+        # (track_id, zone_id) -> timestamp this pair was last actually evaluated
+        self._last_seen: Dict[Tuple[int, str], float] = {}
+        self.track_absence_grace_seconds = track_absence_grace_seconds
 
         self.deduplicator = deduplicator or InMemoryDeduplicator(dedup_cooldown_seconds)
 
@@ -431,13 +440,24 @@ class RuleEngine:
             # Not an error — a camera with no configured zones simply never alerts.
             return []
 
+        # Prune BEFORE touching _last_seen for this frame. This ordering
+        # matters: pruning must judge staleness using each key's PRIOR
+        # last-seen timestamp, not one just updated by the current frame's
+        # tracks. Doing it after (the original, buggy order) meant a track
+        # reappearing after a gap far longer than the grace period always
+        # looked "fresh" by the time staleness was checked — its own
+        # reappearance had already refreshed _last_seen moments earlier in
+        # the same call. Confirmed via a direct test: a track absent for 5s
+        # (grace period 1.5s) incorrectly kept its original loitering dwell
+        # alive instead of restarting it.
+        self._prune_stale_state(timestamp)
+
         events: List[AlertEvent] = []
-        active_keys: Set[Tuple[int, str]] = set()
 
         for track in tracks:
             for zone in zones_for_camera:
                 key = (track.track_id, zone.zone_id)
-                active_keys.add(key)
+                self._last_seen[key] = timestamp
 
                 is_inside = zone.contains(track.centroid)
                 was_inside = self._state.get(key, False)
@@ -455,8 +475,6 @@ class RuleEngine:
                         self._loiter_state.pop(key, None)
 
                 self._state[key] = is_inside
-
-        self._prune_stale_state(active_keys)
 
         # Periodic dedup cleanup so long sessions don't grow the dict forever.
         # Every 200 evaluate() calls is arbitrary but cheap and frequent enough.
@@ -514,16 +532,27 @@ class RuleEngine:
         log.info("ALERT: track_id=%s rule=%s zone='%s' (camera=%s) at t=%.1fs",
                   track.track_id, zone.rule_type, zone.name, zone.camera_id, timestamp)
 
-    def _prune_stale_state(self, active_keys: Set[Tuple[int, str]]) -> None:
+    def _prune_stale_state(self, timestamp: float) -> None:
         """
-        Drops (track_id, zone_id) state entries for tracks no longer present
-        this frame, so a long-running session doesn't accumulate state for
-        every track_id that's ever walked through, forever.
+        Drops (track_id, zone_id) state for pairs not evaluated in over
+        `track_absence_grace_seconds`, so a long-running session doesn't
+        accumulate state for every track_id that's ever walked through, forever.
+
+        Deliberately grace-period-based rather than "not present this exact
+        frame" — a single missed detection (tracker/detector flicker, one
+        dropped frame) is common and should NOT wipe an in-progress loitering
+        dwell. This was a real bug: replaying an actual captured session with
+        one dropped-detection frame in the middle of an otherwise-valid 8+
+        second stationary dwell caused the alert to never fire, because the
+        old logic pruned loiter_state the instant the track was absent from
+        even one frame's active set.
         """
-        stale = [k for k in self._state if k not in active_keys]
+        stale = [k for k, last in self._last_seen.items()
+                 if timestamp - last > self.track_absence_grace_seconds]
         for k in stale:
-            del self._state[k]
+            self._state.pop(k, None)
             self._loiter_state.pop(k, None)
+            self._last_seen.pop(k, None)
 
     def zone_count_for_camera(self, camera_id: str) -> int:
         return len(self._zones_by_camera.get(camera_id, []))
